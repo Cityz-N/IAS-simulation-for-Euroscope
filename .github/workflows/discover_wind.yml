@@ -1,0 +1,20 @@
+name: Discover Meteo-France wind data
+on:
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install requests eccodes
+      - name: Run discovery
+        env:
+          MF_API_KEY: ${{ secrets.MF_API_KEY }}
+          MF_WIND_KEY: ${{ secrets.MF_WIND_KEY }}
+        run: python discover_wind.py
