@@ -131,37 +131,43 @@ def inventory(fn):
 
 def main():
     rs = runs(4)
+    ranges = ["000H024H", "000H012H", "000H006H", "000H003H", "000H001H", "001H001H", "000H048H",
+              "025H048H", "003H006H", "006H012H", "001H006H", "001H003H", "003H003H", "006H006H",
+              "000H000H", "000H072H"]
 
     title("A. 0.25 IP1 : which time ranges are accepted (status only)")
-    ok_run = None
-    for run in rs[:3]:
-        if status_only("0.25", "IP1", run, "000H000H"):
-            ok_run = run
-            break
-    if ok_run is None:
-        print("no run available for 0.25 IP1 ?")
+    run = rs[0]
+    good = []
+    for tm in ranges:
+        if status_only("0.25", "IP1", run, tm):
+            good.append(tm)
+    print("\naccepted ranges for", run, ":", good)
+    if not good:
+        run = rs[1]
+        for tm in ranges[:6]:
+            if status_only("0.25", "IP1", run, tm):
+                good.append(tm)
+        print("accepted (older run)", run, good)
+    if not good:
         return
-    for tm in ("003H003H", "000H003H", "006H006H", "012H012H"):
-        status_only("0.25", "IP1", ok_run, tm)
 
-    title("B. 0.25 IP1 : ONE step, full download + inventory")
-    if download("0.25", "IP1", ok_run, "000H000H", "ip1_025_step0.grib2"):
-        inventory("ip1_025_step0.grib2")
+    def span(t):
+        return int(t[4:7]) - int(t[0:3])
+    best = sorted(good, key=span)[0]
 
-    title("C. 0.1 grid : does it work with other runs / ranges? (status only, then small sample)")
+    title("B. 0.25 IP1 : sample of the smallest accepted range " + best + " (first 250 MB) + inventory")
+    if download("0.25", "IP1", run, best, "ip1_025.grib2", cap=250 * 1024 * 1024):
+        inventory("ip1_025.grib2")
+
+    title("C. 0.1 grid IP1 : accepted ranges (status only) + small sample")
     ok01 = None
-    for run in rs:
-        for tm in ("000H000H", "000H003H"):
-            if status_only("0.1", "IP1", run, tm):
-                ok01 = (run, tm)
-                break
-        if ok01:
+    for tm in ("000H024H", best, "000H006H"):
+        if status_only("0.1", "IP1", run, tm):
+            ok01 = tm
             break
     if ok01:
-        if download("0.1", "IP1", ok01[0], ok01[1], "ip1_01.grib2", cap=60 * 1024 * 1024):
+        if download("0.1", "IP1", run, ok01, "ip1_01.grib2", cap=80 * 1024 * 1024):
             inventory("ip1_01.grib2")
-    else:
-        print("0.1 IP1 not available for any of the last 4 runs with these ranges")
 
 
 if __name__ == "__main__":
