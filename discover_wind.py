@@ -1,113 +1,124 @@
 """
-Discovery for the wind/temperature relay: what does the Meteo-France ARPEGE package API give us?
-Prints NO secrets (the API key comes from the GitHub secret MF_API_KEY).
-Goal: find (1) a working URL pattern, (2) which package holds U/V wind + temperature on
-pressure levels, (3) the grid, (4) the file size.
+Discovery for the wind/temperature relay, round 2.
+Round 1 found the working address (/previnum/DPPaquetARPEGE/v1) and two grids (0.1 and 0.25),
+but hit the API rate limit because it sent far too many requests. This version is polite:
+about one request every 1.5 s, and it waits when the API says "quota exceeded".
+Prints NO secrets (the API key comes from a GitHub secret).
 """
 import datetime as dt
+import json
 import os
+import re
 import sys
 import time
 
 import requests
 
-KEY = (os.environ.get("MF_WIND_KEY", "") or os.environ.get("MF_API_KEY", "")).strip()   # separate key if you made one, else the radar key
+KEY = (os.environ.get("MF_WIND_KEY", "") or os.environ.get("MF_API_KEY", "")).strip()
 if not KEY:
     print("ERROR: neither the secret MF_WIND_KEY nor MF_API_KEY is set.")
     sys.exit(1)
-HEAD = {"apikey": KEY, "accept": "*/*"}
-BASES = [
-    "https://public-api.meteofrance.fr/public/DPPaquetARPEGE/v1",
-    "https://public-api.meteofrance.fr/previnum/DPPaquetARPEGE/v1",
-]
-PARTIAL_BYTES = 40 * 1024 * 1024        # we only need the first messages of a file to see what is inside
+BASE = "https://public-api.meteofrance.fr/previnum/DPPaquetARPEGE/v1"
+PARTIAL_BYTES = 60 * 1024 * 1024        # we only need the first messages of a file to see what is inside
+_last = [0.0]
 
 
 def title(t):
     print("\n" + "=" * 70 + "\n" + t + "\n" + "=" * 70, flush=True)
 
 
-def get(url, params=None, accept="application/json", stream=False, timeout=60):
-    try:
-        return requests.get(url, headers={"apikey": KEY, "accept": accept}, params=params,
-                            timeout=timeout, stream=stream)
-    except requests.RequestException as e:
-        print("   request failed:", type(e).__name__, str(e)[:200])
-        return None
-
-
-def show(r, n=1800):
-    if r is None:
-        return
-    print("   status:", r.status_code, " content-type:", r.headers.get("content-type"))
-    if r.status_code != 200 or "json" in (r.headers.get("content-type") or ""):
-        print("   body:", r.text[:n])
-
-
-def find_base():
-    title("1. Which URL pattern works?")
-    for b in BASES:
-        for path in ("/models/ARPEGE", "/models"):
-            url = b + path
-            print("GET", url.replace("https://public-api.meteofrance.fr", ""))
-            r = get(url)
-            show(r)
-            if r is not None and r.status_code == 200:
-                return b
+def call(url, params=None, accept="application/json", stream=False, timeout=90):
+    """One polite request: spacing between calls and waiting on 429."""
+    for attempt in range(3):
+        wait = 1.6 - (time.time() - _last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last[0] = time.time()
+        try:
+            r = requests.get(url, headers={"apikey": KEY, "accept": accept}, params=params,
+                             timeout=timeout, stream=stream)
+        except requests.RequestException as e:
+            print("   request failed:", type(e).__name__, str(e)[:160])
+            return None
+        if r.status_code == 429:
+            print("   429 quota hit:", r.text[:200].replace("\n", " "), "-> waiting 70 s")
+            r.close()
+            time.sleep(70)
+            continue
+        return r
     return None
 
 
+def short(path):
+    return path.replace(BASE, "")
+
+
 def main():
-    base = find_base()
-    if not base:
-        print("\nNo URL worked. Most likely your application is not subscribed to the ARPEGE package API:")
-        print("portail-api.meteofrance.fr -> API -> 'Paquets ARPEGE' (DPPaquetARPEGE) -> Subscribe, then generate a new key.")
-        return
-    print("\nWORKING BASE:", base)
-
-    title("2. Grids and packages")
+    title("1. Grids")
+    r = call(BASE + "/models/ARPEGE/grids")
     grids = []
-    r = get(base + "/models/ARPEGE/grids")
-    show(r, 3000)
-    try:
-        j = r.json()
-        grids = [str(g.get("name", g)) if isinstance(g, dict) else str(g) for g in (j.get("grids", j) if isinstance(j, dict) else j)]
-    except Exception:
-        pass
-    print("grids found:", grids)
-    for g in grids[:6]:
-        print("\n-- grid", g)
-        rr = get(base + f"/models/ARPEGE/grids/{g}/packages")
-        show(rr, 2500)
+    if r is not None and r.status_code == 200:
+        for l in r.json().get("links", []):
+            m = re.search(r"/grids/([0-9.]+)$", l.get("href", ""))
+            if m:
+                grids.append(m.group(1))
+    print("grids:", grids)
+    if not grids:
+        print("   (could not read the grid list)", r.text[:500] if r is not None else "")
+        return
 
-    title("3. Description of the isobaric packages")
-    for g in grids[:6]:
-        for p in ("IP1", "IP2", "IP3", "IP4", "SP1"):
-            rr = get(base + f"/models/ARPEGE/grids/{g}/packages/{p}")
-            if rr is not None and rr.status_code == 200:
-                print(f"grid {g} package {p}:", rr.text[:1500])
+    title("2. Packages of each grid")
+    packages = {}
+    for g in grids:
+        r = call(BASE + f"/models/ARPEGE/grids/{g}/packages")
+        print(f"\n-- grid {g}: HTTP {r.status_code if r is not None else '?'}")
+        if r is None or r.status_code != 200:
+            print(r.text[:600] if r is not None else "")
+            continue
+        print(json.dumps(r.json(), ensure_ascii=False)[:3500])
+        names = []
+        for l in r.json().get("links", []):
+            m = re.search(r"/packages/([A-Za-z0-9_]+)$", l.get("href", ""))
+            if m:
+                names.append(m.group(1))
+        packages[g] = names
+        print("   package names:", names)
 
-    title("4. Try a download (first 40 MB only)")
-    now = dt.datetime.utcnow()
+    title("3. Description of each package (one request each)")
+    desc = {}
+    for g in grids:
+        for p in packages.get(g, []):
+            r = call(BASE + f"/models/ARPEGE/grids/{g}/packages/{p}")
+            if r is None or r.status_code != 200:
+                print(f"grid {g} {p}: HTTP {r.status_code if r is not None else '?'}")
+                continue
+            txt = json.dumps(r.json(), ensure_ascii=False)
+            desc[(g, p)] = txt
+            print(f"\ngrid {g} package {p}:\n  {txt[:1800]}")
+
+    title("4. Download test (first 60 MB only), few attempts")
+    now = dt.datetime.now(dt.timezone.utc)
     runs = []
-    for back in range(5, 40, 6):
+    for back in (6, 12, 18):
         t = now - dt.timedelta(hours=back)
-        t = t.replace(hour=(t.hour // 6) * 6, minute=0, second=0, microsecond=0)
-        if t not in runs:
-            runs.append(t)
-    got = None
-    for g in grids[:6]:
-        for p in ("IP1", "IP2", "IP3", "IP4"):
-            for run in runs[:3]:
-                for tm in ("000H012H", "00H06H", "000H024H", "00H24H", "0H6H"):
+        runs.append(t.replace(hour=(t.hour // 6) * 6, minute=0, second=0, microsecond=0))
+    tried = 0
+    done = set()
+    for g in grids:
+        # the isobaric packages are called IPx; try them first, one per grid, then HPx
+        for p in [x for x in packages.get(g, []) if x.upper().startswith("IP")][:2]:
+            ok = False
+            for run in runs[:2]:
+                for tm in ("000H024H", "00H24H"):
                     ref = run.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    url = base + f"/models/ARPEGE/grids/{g}/packages/{p}/productARP"
-                    r = get(url, {"referencetime": ref, "time": tm, "format": "grib2"}, accept="*/*", stream=True, timeout=120)
+                    url = BASE + f"/models/ARPEGE/grids/{g}/packages/{p}/productARP"
+                    r = call(url, {"referencetime": ref, "time": tm, "format": "grib2"}, accept="*/*", stream=True, timeout=180)
+                    tried += 1
                     if r is None:
                         continue
-                    code = r.status_code
-                    print(f"grid {g} {p} run {ref} time {tm}: HTTP {code}", "" if code == 200 else r.text[:150].replace("\n", " "))
-                    if code == 200:
+                    print(f"grid {g} {p} run {ref} time {tm}: HTTP {r.status_code}",
+                          "" if r.status_code == 200 else r.text[:200].replace("\n", " "))
+                    if r.status_code == 200:
                         fn = f"sample_{g}_{p}.grib2"
                         n = 0
                         t0 = time.time()
@@ -117,16 +128,17 @@ def main():
                                 n += len(chunk)
                                 if n >= PARTIAL_BYTES:
                                     break
+                        total = r.headers.get("content-length")
                         r.close()
-                        print(f"   saved {fn}: {n / 1e6:.1f} MB in {time.time() - t0:.0f}s (total size header: {r.headers.get('content-length')})")
-                        got = fn
+                        print(f"   saved {fn}: {n / 1e6:.1f} MB in {time.time() - t0:.0f}s (full size: {total})")
                         inventory(fn)
+                        ok = True
                         break
-                if got and got.startswith(f"sample_{g}_{p}"):
+                if ok:
                     break
-            if got and got.startswith(f"sample_{g}_{p}"):
-                got = None          # try the next package too, so we see all of them
-                continue
+            if tried > 14:
+                print("(stopping: enough attempts for one run)")
+                return
 
 
 def inventory(fn):
@@ -151,18 +163,21 @@ def inventory(fn):
                 key = (g("shortName"), g("typeOfLevel"), g("level"), g("stepRange"))
                 seen[key] = seen.get(key, 0) + 1
                 if first is None:
-                    first = {k: g(k) for k in ("Ni", "Nj", "latitudeOfFirstPointInDegrees", "longitudeOfFirstPointInDegrees",
-                                               "latitudeOfLastPointInDegrees", "longitudeOfLastPointInDegrees",
-                                               "iDirectionIncrementInDegrees", "jDirectionIncrementInDegrees",
-                                               "dataDate", "dataTime", "gridType")}
+                    first = {}
+                    for k in ("Ni", "Nj", "latitudeOfFirstPointInDegrees", "longitudeOfFirstPointInDegrees",
+                              "latitudeOfLastPointInDegrees", "longitudeOfLastPointInDegrees",
+                              "iDirectionIncrementInDegrees", "jDirectionIncrementInDegrees",
+                              "dataDate", "dataTime", "gridType"):
+                        try:
+                            first[k] = g(k)
+                        except Exception:
+                            first[k] = "?"
             finally:
                 eccodes.codes_release(h)
     print("   grid:", first)
-    names = sorted({(k[0], k[1]) for k in seen})
-    print("   parameters (shortName, typeOfLevel):", names)
     for sn in sorted({k[0] for k in seen}):
         lv = sorted({(k[1], k[2]) for k in seen if k[0] == sn})
-        print(f"   {sn}: levels {lv[:40]}")
+        print(f"   {sn}: {len(lv)} levels e.g. {lv[:30]}")
     print("   steps seen:", sorted({k[3] for k in seen})[:20])
 
 
